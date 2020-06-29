@@ -1,98 +1,82 @@
-import datetime as dt
+import asyncio
+from io import StringIO
+import unittest
 import logging
+import time
+import sys
 import threading
+
+import datetime as dt
 
 from pymongo import MongoClient
 from pymongo.collection import Collection
 from pymongo.errors import OperationFailure
 from pymongo.errors import ServerSelectionTimeoutError
 
-"""
-Example format of generated bson document:
-{
-    'thread': -1216977216,
-    'threadName': 'MainThread',
-    'level': 'ERROR',
-    'timestamp': datetime.datetime(2016, 8, 16, 15, 20, 24, 794341),
-    'message': 'test message',
-    'module': 'test_module',
-    'fileName': '/var/projects/python/log4mongo-python/tests/test_handlers.py',
-    'lineNumber': 38,
-    'method': 'test_emit_exception',
-    'loggerName':  'testLogger',
-    'exception': {
-        'stackTrace': 'Traceback (most recent call last):
-                       File "/var/projects/python/log4mongo-python/tests/\
-                           test_handlers.py", line 36, in test_emit_exception
-                       raise Exception(\'exc1\')
-                       Exception: exc1',
-        'message': 'exc1',
-        'code': 0
-    }
-}
-"""
+from aiologger.filters import Filter
+from aiologger.formatters.base import Formatter
+from aiologger.handlers.base import Handler
+from aiologger.levels import LogLevel
+from aiologger.protocols import AiologgerProtocol
+from aiologger.records import LogRecord
+
 _connection = None
 
+class MongoFormatter(Formatter):
 
-class MongoFormatter(logging.Formatter):
-
-    DEFAULT_PROPERTIES = logging.LogRecord(
-        '', '', '', '', '', '', '', '').__dict__.keys()
+    DEFAULT_PROPERTIES = LogRecord(
+        '', 0, '', 0, '', '', '', '', '').__dict__.keys()
 
     def format(self, record):
         """Formats LogRecord into python dictionary."""
         # Standard document
+        logging.info(record.exc_info)
         document = {
             'timestamp': dt.datetime.utcnow(),
             'level': record.levelname,
-            'thread': record.thread,
-            'threadName': record.threadName,
-            'message': record.getMessage(),
             'loggerName': record.name,
+            'message': record.msg,
             'fileName': record.pathname,
-            'module': record.module,
             'method': record.funcName,
             'lineNumber': record.lineno
         }
         # Standard document decorated with exception info
         if record.exc_info is not None:
             document.update({
-                'exception': {
-                    'message': str(record.exc_info[1]),
-                    'code': 0,
-                    'stackTrace': self.formatException(record.exc_info)
-                }
+                'exc_message': str(record.exc_info[1]),
+                 #'stackTrace': Formatter.format_exception(self, record.exc_info)
             })
         # Standard document decorated with extra contextual information
-        if len(self.DEFAULT_PROPERTIES) != len(record.__dict__):
+        if len(MongoFormatter.DEFAULT_PROPERTIES) != len(record.__dict__):
             contextual_extra = set(record.__dict__).difference(
-                set(self.DEFAULT_PROPERTIES))
+                set(MongoFormatter.DEFAULT_PROPERTIES))
             if contextual_extra:
                 for key in contextual_extra:
                     document[key] = record.__dict__[key]
         return document
 
 
-class MongoHandler(logging.Handler):
+class AsyncMongoHandler(Handler):
 
-    def __init__(self, level=logging.NOTSET, host='localhost', port=27017,
-                 database_name='logs', collection='logs',
+    terminator = "\n"
+
+    def __init__(self, level=LogLevel.NOTSET, host='localhost', port=27017,
+                 database_name='logs', collection='logs', loop=None,
                  username=None, password=None, authentication_db='admin',
                  fail_silently=False, formatter=None, capped=False,
                  capped_max=1000, capped_size=1000000, reuse=True, **kwargs):
         """
         Setting up mongo handler, initializing mongo database connection via
         pymongo.
-
         If reuse is set to false every handler will have it's own MongoClient.
         This could hammer down your MongoDB instance, but you can still use
         this option.
-
         The default is True. As such a program with multiple handlers
         that log to mongodb will have those handlers share a single connection
         to MongoDB.
         """
-        logging.Handler.__init__(self, level)
+        super().__init__(loop=loop)
+
         self.host = host
         self.port = port
         self.database_name = database_name
@@ -105,12 +89,25 @@ class MongoHandler(logging.Handler):
         self.db = None
         self.collection = None
         self.authenticated = False
-        self.formatter = formatter or MongoFormatter()
+        self.formatter = formatter or MongoFormatter
         self.capped = capped
         self.capped_max = capped_max
         self.capped_size = capped_size
         self.reuse = reuse
+
+        self._initialization_lock = asyncio.Lock(loop=self.loop)
+        
         self._connect(**kwargs)
+
+    @property
+    def initialized(self):
+        return self.writer is not None
+
+    async def _init_writer(self):
+        pass
+
+    async def flush(self):
+        self.connection.fsync(options={'async': True})
 
     def _connect(self, **kwargs):
         """Connecting to mongo database."""
@@ -148,7 +145,17 @@ class MongoHandler(logging.Handler):
         else:
             self.collection = self.db[self.collection_name]
 
-    def close(self):
+    async def emit(self, record):
+        """Inserting new logging record to mongo database."""
+        if self.collection is not None:
+            try:
+                self.collection.insert_one(self.formatter.format(self, record))
+                await self.flush()
+            except Exception as e:
+                if not self.fail_silently:
+                    logging.exception(e)
+
+    async def close(self):
         """
         If authenticated, logging out and closing mongo database connection.
         """
@@ -157,111 +164,3 @@ class MongoHandler(logging.Handler):
         if self.connection is not None:
             self.connection.close()
 
-    def emit(self, record):
-        """Inserting new logging record to mongo database."""
-        if self.collection is not None:
-            try:
-                self.collection.insert_one(self.format(record))
-            except Exception:
-                if not self.fail_silently:
-                    self.handleError(record)
-
-    def __exit__(self, type, value, traceback):
-        self.close()
-
-
-class BufferedMongoHandler(MongoHandler):
-
-    def __init__(self, level=logging.NOTSET, host='localhost', port=27017,
-                 database_name='logs', collection='logs',
-                 username=None, password=None, authentication_db='admin',
-                 fail_silently=False, formatter=None, capped=False,
-                 capped_max=1000, capped_size=1000000, reuse=True,
-                 buffer_size=100, buffer_periodical_flush_timing=5.0,
-                 buffer_early_flush_level=logging.CRITICAL, **kwargs):
-        """
-        Setting up buffered mongo handler, initializing mongo database connection via
-        pymongo.
-
-        This subclass aims to provide buffering mechanism to avoid hammering the database server and
-        write-locking the database too often (even if mongo is performant in that matter).
-
-        If buffer_periodical_flush_timer is set to None or 0, no periodical flush of the buffer will be done.
-        It means that buffered messages might be stuck here for a while until the buffer full or
-        a critical message is sent (both causing flush).
-
-        If buffer_periodical_flush_timer is set to numeric value, a thread with timer will be launched
-        to call the buffer flush periodically.
-        """
-
-        MongoHandler.__init__(self, level=level, host=host, port=port, database_name=database_name, collection=collection,
-                              username=username, password=password, authentication_db=authentication_db,
-                              fail_silently=fail_silently, formatter=formatter, capped=capped, capped_max=capped_max,
-                              capped_size=capped_size, reuse=reuse, **kwargs)
-        self.buffer = []
-        self.buffer_size = buffer_size
-        self.buffer_periodical_flush_timing = buffer_periodical_flush_timing
-        self.buffer_early_flush_level = buffer_early_flush_level
-        self.last_record = None #kept for handling the error on flush
-        self.buffer_timer_thread = None
-
-        self.buffer_lock = threading.RLock()
-
-        self._timer_stopper = None
-
-        # setup periodical flush
-        if self.buffer_periodical_flush_timing:
-
-            # clean exit event
-            import atexit
-            atexit.register(self.destroy)
-
-            # call at interval function
-            def call_repeatedly(interval, func, *args):
-                stopped = threading.Event()
-
-                # actual thread function
-                def loop():
-                    while not stopped.wait(interval):  # the first call is in `interval` secs
-                        func(*args)
-
-                timer_thread = threading.Thread(target=loop)
-                timer_thread.daemon = True
-                timer_thread.start()
-                return stopped.set, timer_thread
-
-            # launch thread
-            self._timer_stopper, self.buffer_timer_thread = call_repeatedly(self.buffer_periodical_flush_timing, self.flush_to_mongo)
-
-    def emit(self, record):
-        """Inserting new logging record to buffer and flush if necessary."""
-
-        with self.buffer_lock:
-            self.last_record = record
-            self.buffer.append(self.format(record))
-
-        if len(self.buffer) >= self.buffer_size or record.levelno >= self.buffer_early_flush_level:
-            self.flush_to_mongo()
-
-    def flush_to_mongo(self):
-        """Flush all records to mongo database."""
-        if self.collection is not None and len(self.buffer) > 0:
-            with self.buffer_lock:
-                try:
-                    self.collection.insert_many(self.buffer)
-                    self.empty_buffer()
-                except Exception:
-                    if not self.fail_silently:
-                        self.handleError(self.last_record) #handling the error on flush
-
-    def empty_buffer(self):
-        """Empty the buffer list."""
-        del self.buffer
-        self.buffer = []
-
-    def destroy(self):
-        """Clean quit logging. Flush buffer. Stop the periodical thread if needed."""
-        if self._timer_stopper:
-            self._timer_stopper()
-        self.flush_to_mongo()
-        self.close()
