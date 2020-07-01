@@ -5,6 +5,7 @@ import logging
 import time
 import sys
 import threading
+import traceback
 
 import datetime as dt
 
@@ -30,21 +31,25 @@ class MongoFormatter(Formatter):
     def format(self, record):
         """Formats LogRecord into python dictionary."""
         # Standard document
-        logging.info(record.exc_info)
         document = {
-            'timestamp': dt.datetime.utcnow(),
             'level': record.levelname,
             'loggerName': record.name,
             'message': record.msg,
-            'fileName': record.pathname,
-            'method': record.funcName,
-            'lineNumber': record.lineno
+            'timestamp': dt.datetime.utcnow()
         }
         # Standard document decorated with exception info
         if record.exc_info is not None:
+            tblist = traceback.extract_tb(record.exc_info[2])
+            last_traceback_item = tblist[-1]
             document.update({
-                'exc_message': str(record.exc_info[1]),
-                 #'stackTrace': Formatter.format_exception(self, record.exc_info)
+                'exception':{
+                    'exc_message': str(record.exc_info[1]),
+                    'exc_fileName': last_traceback_item.filename,
+                    'exc_method': last_traceback_item.name,
+                    'exc_lineno': last_traceback_item.lineno,
+                    'exc_line': last_traceback_item.line,
+                    'exc_trace': Formatter.format_exception(self, record.exc_info)
+                }
             })
         # Standard document decorated with extra contextual information
         if len(MongoFormatter.DEFAULT_PROPERTIES) != len(record.__dict__):
@@ -61,7 +66,7 @@ class AsyncMongoHandler(Handler):
     terminator = "\n"
 
     def __init__(self, level=LogLevel.NOTSET, host='localhost', port=27017,
-                 database_name='logs', collection='logs', loop=None,
+                 database_name='logs', collection='logs', loop=None, mongo_job_id=None,
                  username=None, password=None, authentication_db='admin',
                  fail_silently=False, formatter=None, capped=False,
                  capped_max=1000, capped_size=1000000, reuse=True, **kwargs):
@@ -94,20 +99,25 @@ class AsyncMongoHandler(Handler):
         self.capped_max = capped_max
         self.capped_size = capped_size
         self.reuse = reuse
+        self.mongo_job_id = mongo_job_id
 
         self._initialization_lock = asyncio.Lock(loop=self.loop)
         
         self._connect(**kwargs)
 
+
     @property
     def initialized(self):
         return self.writer is not None
 
+
     async def _init_writer(self):
         pass
 
+
     async def flush(self):
         self.connection.fsync(options={'async': True})
+
 
     def _connect(self, **kwargs):
         """Connecting to mongo database."""
@@ -145,15 +155,25 @@ class AsyncMongoHandler(Handler):
         else:
             self.collection = self.db[self.collection_name]
 
+
     async def emit(self, record):
         """Inserting new logging record to mongo database."""
         if self.collection is not None:
             try:
-                self.collection.insert_one(self.formatter.format(self, record))
+                self.collection.update_one(
+                    {
+                        'mongo_job_id': {'$eq': self.mongo_job_id }
+                    },
+                    {'$push': {
+                        'records': self.formatter.format(self, record)
+                    }},
+                    upsert=True,
+                )
                 await self.flush()
             except Exception as e:
                 if not self.fail_silently:
                     logging.exception(e)
+
 
     async def close(self):
         """
