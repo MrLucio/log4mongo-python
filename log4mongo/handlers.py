@@ -66,7 +66,7 @@ class AsyncMongoHandler(Handler):
     terminator = "\n"
 
     def __init__(self, level=LogLevel.NOTSET, host='localhost', port=27017,
-                 database_name='logs', collection='logs', loop=None, mongo_job_id=None,
+                 database_name='logs', collection='logs', loop=None,
                  username=None, password=None, authentication_db='admin',
                  fail_silently=False, formatter=None, capped=False,
                  capped_max=1000, capped_size=1000000, reuse=True, **kwargs):
@@ -99,11 +99,15 @@ class AsyncMongoHandler(Handler):
         self.capped_max = capped_max
         self.capped_size = capped_size
         self.reuse = reuse
-        self.mongo_job_id = mongo_job_id
+        self.mongo_job_id = None
 
         self._initialization_lock = asyncio.Lock(loop=self.loop)
         
         self._connect(**kwargs)
+
+
+    def set_mongo_job_id(self, mongo_job_id):
+        self.mongo_job_id = mongo_job_id
 
 
     @property
