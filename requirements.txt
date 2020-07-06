@@ -1,2 +1,2 @@
-pymongo>=3.9
+pymongo[tls]>=3.9
 aiologger==0.5.0
