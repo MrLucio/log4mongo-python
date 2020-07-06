@@ -65,9 +65,9 @@ class AsyncMongoHandler(Handler):
 
     terminator = "\n"
 
-    def __init__(self, level=LogLevel.NOTSET, host='localhost', port=27017,
-                 database_name='logs', collection='logs', loop=None,
-                 username=None, password=None, authentication_db='admin',
+    def __init__(self, URI, level=LogLevel.NOTSET,  collection='logs',
+                 loop=None, username=None, password=None,
+                 database_name=None, authentication_db='admin',
                  fail_silently=False, formatter=None, capped=False,
                  capped_max=1000, capped_size=1000000, reuse=True, **kwargs):
         """
@@ -82,8 +82,7 @@ class AsyncMongoHandler(Handler):
         """
         super().__init__(loop=loop)
 
-        self.host = host
-        self.port = port
+        self.URI = URI
         self.database_name = database_name
         self.collection_name = collection
         self.username = username
@@ -129,8 +128,7 @@ class AsyncMongoHandler(Handler):
         if self.reuse and _connection:
             self.connection = _connection
         else:
-            self.connection = MongoClient(host=self.host, port=self.port,
-                                          **kwargs)
+            self.connection = MongoClient(self.URI)
             try:
                 self.connection.is_primary
             except ServerSelectionTimeoutError:
