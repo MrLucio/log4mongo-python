@@ -109,3 +109,6 @@ class AsyncMongoHandler(Handler):
             except Exception as e:
                 if not self.fail_silently:
                     logging.exception(e)
+
+    async def close(self):
+        pass
